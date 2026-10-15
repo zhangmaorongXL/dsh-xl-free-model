@@ -25,7 +25,11 @@ const config = loadConfig();
 const PROXY_HOST = config.proxyHost || "127.0.0.1";
 const PROXY_PORT = config.proxyPort || 8787;
 const API_KEY = config.apiKey || "";
-const DIRECTORY = config.directory || process.cwd();
+// Workspace directory for the OpenCode backend. Priority:
+//   1. OPENCODE_PROXY_DIRECTORY env (set by index.js from the dsh process cwd)
+//   2. config.directory in proxy.config.json
+//   3. process.cwd() as last resort
+const DIRECTORY = process.env.OPENCODE_PROXY_DIRECTORY || config.directory || process.cwd();
 const PROVIDER_ID = "opencode";
 
 const CLI_CFG = (config.backend && config.backend.cli) || {};

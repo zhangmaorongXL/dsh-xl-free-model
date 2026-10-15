@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { XlFreeModelAdapter, PROVIDER } from "./adapter.js";
 
 export const name = "dsh-xl-free-model";
-export const version = "1.4.0";
+export const version = "1.4.1";
 export const inject = ["llm"];
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -176,6 +176,11 @@ export function apply(ctx, options) {
   const port = Number((options && options.port) || config.proxyPort || 8787);
   const apiKey = (options && options.apiKey) || config.apiKey || "";
 
+  // Capture the dsh process's cwd (the user's selected workspace) before we
+  // spawn the proxy with cwd=here; without this the proxy would treat the
+  // plugin folder as the backend workspace.
+  const dshWorkdir = process.cwd();
+
   if (apiKey && !process.env.OPENCODE_PROXY_FREE_API_KEY) {
     process.env.OPENCODE_PROXY_FREE_API_KEY = apiKey;
   }
@@ -213,9 +218,10 @@ export function apply(ctx, options) {
       log(ctx, "error", `proxy.cjs missing at ${proxyMain}`);
       return;
     }
-    log(ctx, "info", `starting proxy on 127.0.0.1:${port}`);
+    log(ctx, "info", `starting proxy on 127.0.0.1:${port} (workspace: ${dshWorkdir})`);
     child = spawn(process.execPath, [proxyMain], {
       cwd: here,
+      env: { ...process.env, OPENCODE_PROXY_DIRECTORY: dshWorkdir },
       stdio: "ignore",
       windowsHide: true,
     });
