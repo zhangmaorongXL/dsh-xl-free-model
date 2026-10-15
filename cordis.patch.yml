@@ -1,0 +1,10 @@
+# dsh-xl-free-model bundle patch.
+#
+# 只挂载 Host 半身（自动拉起/接管本地代理、注入 API Key 环境变量、
+# 通过 ctx.llm.registerAdapter 把 xl-free-model provider 注册进会话
+# 模型选择列表）。不 patch llm-pi-ai：dsh 的 patch 是整行 config
+# 替换（无深度合并），覆盖会清空用户其他 provider。
+- insert:
+    - id: dsh-xl-free-model
+      name: 'dsh-xl-free-model'
+      config: {}
