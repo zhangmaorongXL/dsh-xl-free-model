@@ -289,16 +289,19 @@ function invalidateBackend() {
 async function backendFetch(method, pathname, body, timeoutMs = SHORT_TIMEOUT_MS) {
   const b = await ensureBackend();
   let res;
+  const opts = {
+    method,
+    headers: {
+      authorization: b.authHeader,
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  };
+  // timeoutMs <= 0 disables the absolute timeout (used for long-lived SSE such
+  // as GET /event, which must not be aborted on a fixed clock).
+  if (timeoutMs > 0) opts.signal = AbortSignal.timeout(timeoutMs);
   try {
-    res = await fetch(b.base + pathname, {
-      method,
-      headers: {
-        authorization: b.authHeader,
-        ...(body !== undefined ? { "content-type": "application/json" } : {}),
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    res = await fetch(b.base + pathname, opts);
   } catch (e) {
     invalidateBackend();
     throw new BackendError("无法连接 opencode 后端: " + e.message, true);
@@ -817,7 +820,7 @@ async function handleChatCompletion(req, res, body) {
   // ---- streaming ----
   let sse;
   try {
-    sse = await backendFetch("GET", "/event?" + dirQ, undefined, SHORT_TIMEOUT_MS);
+    sse = await backendFetch("GET", "/event?" + dirQ, undefined, 0);
   } catch (e) {
     return sendOpenAiError(res, 502, e.message, "server_error");
   }
