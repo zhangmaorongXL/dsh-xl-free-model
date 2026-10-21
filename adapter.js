@@ -87,6 +87,18 @@ function finishFromToken(token) {
   return { kind: "stop" };
 }
 
+/**
+ * Build an Error whose own `code` + `failure` properties survive
+ * dsh-llm normalizeLlmFailure, so the terminal finish chunk carries a typed
+ * provider failure instead of `code: UNKNOWN`.
+ */
+function streamFailure(message, code) {
+  const err = new Error(message);
+  err.code = code;
+  err.failure = { message, code };
+  return err;
+}
+
 async function resolveUserAgent() {
   try {
     const mod = await import("@deepseek-ai/dsh-llm");
@@ -216,9 +228,10 @@ export class XlFreeModelAdapter {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      const err = new Error(`proxy HTTP ${res.status}: ${text.slice(0, 400)}`);
-      err.code = "PROXY_HTTP_" + res.status;
-      throw err;
+      throw streamFailure(
+        `proxy HTTP ${res.status}: ${text.slice(0, 400)}`,
+        "PROXY_HTTP_" + res.status
+      );
     }
 
     const blocks = new Map();
@@ -239,6 +252,7 @@ export class XlFreeModelAdapter {
     let finishReason = null;
     let usage = null;
 
+    let pendingError = null;
     const processLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed.startsWith("data:")) return;
@@ -248,6 +262,16 @@ export class XlFreeModelAdapter {
       try {
         payload = JSON.parse(data);
       } catch {
+        return;
+      }
+      if (payload.error) {
+        const message = payload.error.message ? String(payload.error.message) : "proxy stream error";
+        const code =
+          typeof payload.error.code === "string" && payload.error.code !== ""
+            ? payload.error.code
+            : "PROXY_STREAM_ERROR";
+        pendingError = streamFailure(message, code);
+        reader.cancel().catch(() => {});
         return;
       }
       if (payload.usage) {
@@ -302,11 +326,14 @@ export class XlFreeModelAdapter {
         const line = buffer.slice(0, nl);
         buffer = buffer.slice(nl + 1);
         processLine(line);
+        if (pendingError) break;
       }
       while (emitQueue.length) yield emitQueue.shift();
+      if (pendingError) throw pendingError;
     }
     if (buffer) processLine(buffer);
     while (emitQueue.length) yield emitQueue.shift();
+    if (pendingError) throw pendingError;
 
     for (const block of blocks.values()) {
       if (block.closed) continue;
@@ -329,7 +356,10 @@ export class XlFreeModelAdapter {
       }
     }
     if (usage) yield { type: "usage", usage };
-    yield { type: "finish", reason: sawFinish ? finishReason : { kind: "stop" } };
+    if (!sawFinish) {
+      throw streamFailure("proxy stream ended without a finish reason", "PROXY_STREAM_TRUNCATED");
+    }
+    yield { type: "finish", reason: finishReason };
   }
 }
 

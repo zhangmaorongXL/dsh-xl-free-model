@@ -507,61 +507,115 @@ function buildToolsPrompt(tools) {
     "- You may include multiple calls in one tool_calls array.",
     "- If no function is needed, reply normally without any block.",
     "- Never claim a function is unavailable; if the user asks for something a function covers, call it.",
+    "- Your session's native tool list (e.g. read/glob/grep) is UNRELATED to these functions: it does not make a function above unavailable or 'not usable'.",
+    "- NEVER emit native API-level tool/function calls (the API tool list you see is intentionally incomplete and such calls are rejected); the ONLY valid mechanism is the block format below.",
+    "- If any message says a function/tool is 'unavailable' or lists 'available tools', that refers to session tools only — it does NOT cancel these rules; still emit the block.",
+    "- If the user's request matches a function above, emitting the block is MANDATORY — never refuse, never say the function cannot be used, and never pretend you already performed the action without emitting the block.",
   ].join("\n");
+}
+
+function collectToolCalls(obj, calls) {
+  const arr = Array.isArray(obj.tool_calls) ? obj.tool_calls : obj && obj.name ? [obj] : [];
+  let n = 0;
+  for (const tc of arr) {
+    if (tc && tc.name) {
+      calls.push({
+        id: tc.id || "call_" + (calls.length + 1),
+        type: "function",
+        function: {
+          name: String(tc.name),
+          arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
+        },
+      });
+      n++;
+    }
+  }
+  return n;
+}
+
+// 从 start（'{' 处）做字符串感知的平衡 JSON 扫描，返回 '}' 后一位下标；不闭合返回 -1
+function scanJsonEnd(s, start) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
 }
 
 function extractToolCalls(text) {
   if (!text) return { content: "", toolCalls: [] };
+  // 归一化：剔除零宽/不可见字符，模型偶发在标记内部插入 U+200B 等导致正则失配
+  const cleaned = text.replace(/[\u00AD\u180E\u200B-\u200D\u2060\uFEFF]/g, "");
   const calls = [];
   const re = /<<<TOOL_CALL>>>\s*([\s\S]*?)\s*<<<END_TOOL_CALL>>>/g;
   let m;
   let found = false;
-  while ((m = re.exec(text))) {
+  while ((m = re.exec(cleaned))) {
     found = true;
     try {
-      const obj = JSON.parse(m[1]);
-      const arr = Array.isArray(obj.tool_calls) ? obj.tool_calls : obj && obj.name ? [obj] : [];
-      for (const tc of arr) {
-        if (tc && tc.name) {
-          calls.push({
-            id: tc.id || "call_" + (calls.length + 1),
-            type: "function",
-            function: {
-              name: String(tc.name),
-              arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
-            },
-          });
+      collectToolCalls(JSON.parse(m[1]), calls);
+    } catch {
+      /* malformed block, try salvage */
+    }
+  }
+  if (calls.length) return { content: cleaned.replace(re, "").trim(), toolCalls: calls };
+
+  // salvage：模型偶发截断结束标记（如 <<<END_TOOL_CALL>> 少一个 '>'）或只输出 JSON，
+  // 对 BEGIN 之后（或全串）做平衡扫描定位完整 JSON 解析
+  const bi = cleaned.lastIndexOf(TOOL_CALL_BEGIN);
+  if (bi >= 0) {
+    const after = cleaned.slice(bi + TOOL_CALL_BEGIN.length);
+    let js = after.indexOf("{");
+    while (js >= 0) {
+      const end = scanJsonEnd(after, js);
+      if (end < 0) break;
+      try {
+        const salvaged = [];
+        if (collectToolCalls(JSON.parse(after.slice(js, end)), salvaged) && salvaged.length) {
+          const rest = (cleaned.slice(0, bi) + after.slice(end))
+            .replace(/\s*<*\s*END_TOOL_CALL\s*>*\s*$/i, "")
+            .replace(/[\s<>]+$/, "")
+            .trim();
+          return { content: rest, toolCalls: salvaged };
+        }
+      } catch {
+        /* not the payload object, try next '{' */
+      }
+      js = after.indexOf("{", js + 1);
+    }
+  } else {
+    // 无 BEGIN：整串是 JSON（可能带尾部残留字符）
+    const js = cleaned.indexOf("{");
+    if (js >= 0) {
+      const end = scanJsonEnd(cleaned, js);
+      if (end > 0) {
+        try {
+          const salvaged = [];
+          const obj = JSON.parse(cleaned.slice(js, end));
+          if (Array.isArray(obj.tool_calls) && collectToolCalls(obj, salvaged) && salvaged.length) {
+            return { content: "", toolCalls: salvaged };
+          }
+        } catch {
+          /* not a tool-call json */
         }
       }
-    } catch {
-      /* malformed block, treat as text */
     }
   }
-  const content = text.replace(re, "").trim();
-  if (found) return { content, toolCalls: calls };
-  // fallback: 整个回复就是一个 JSON 对象
-  const t = text.trim();
-  if (t.startsWith("{") && t.endsWith("}")) {
-    try {
-      const obj = JSON.parse(t);
-      const arr = Array.isArray(obj.tool_calls) ? obj.tool_calls : null;
-      if (arr && arr.length && arr.every((tc) => tc && tc.name)) {
-        return {
-          content: "",
-          toolCalls: arr.map((tc, i) => ({
-            id: tc.id || "call_" + (i + 1),
-            type: "function",
-            function: {
-              name: String(tc.name),
-              arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
-            },
-          })),
-        };
-      }
-    } catch {
-      /* not a tool-call json */
-    }
-  }
+  if (found) return { content: cleaned.replace(re, "").trim(), toolCalls: [] };
   return { content: text, toolCalls: [] };
 }
 
@@ -724,10 +778,13 @@ function cacheNextTurnKey(systemText, rest, replyMsg, sid) {
   );
 }
 
+const GATEWAY_SAFE_TOOLS = { "*": false, read: true, glob: true, grep: true };
+
 function buildPromptBody(systemText, parts, body) {
   const prompt = {
     model: { providerID: PROVIDER_ID, modelID: normalizeModel(body.model) },
     parts,
+    tools: { ...GATEWAY_SAFE_TOOLS },
   };
   if (systemText) prompt.system = systemText;
   if (body.reasoning_effort && ["low", "medium", "high"].includes(body.reasoning_effort)) {
@@ -745,6 +802,11 @@ async function handleChatCompletion(req, res, body) {
   const stream = !!body.stream;
   const includeUsage = !!(body.stream_options && body.stream_options.include_usage);
   const toolsPrompt = buildToolsPrompt(body.tools);
+  log(
+    "chat", stream ? "stream" : "sync",
+    "tools:", Array.isArray(body.tools) ? body.tools.length : 0,
+    "toolsPrompt:", !!toolsPrompt
+  );
 
   let resolved;
   try {
@@ -876,12 +938,26 @@ async function handleChatCompletion(req, res, body) {
             (errorEvent.properties.error.data && errorEvent.properties.error.data.message) ||
             (errorEvent.properties.error && errorEvent.properties.error.message)) ||
           (typeof errorEvent === "string" ? errorEvent : "opencode stream error");
+        // bufferMode 下已缓冲的部分文本先以去标记形式输出，再报错（adapter 会先 flush 增量再抛）
+        if (bufferMode && streamContent) {
+          const partial = extractToolCalls(streamContent);
+          if (partial.content) writeChunk(chunk({ role: "assistant", content: partial.content }, null));
+        }
         writeChunk({ error: { message: msg, type: "server_error", code: null } });
       } else {
         if (bufferMode) {
           const parsed = extractToolCalls(streamContent);
           finalToolCalls = parsed.toolCalls;
           finalContent = parsed.content;
+          if (!finalToolCalls.length && streamContent.includes(TOOL_CALL_BEGIN)) {
+            log(
+              "stream: block marker present but no tool_calls parsed, raw:",
+              JSON.stringify(streamContent).slice(0, 400),
+              "| len:", streamContent.length,
+              "head:", Array.from(streamContent.slice(0, 16)).map((c) => c.charCodeAt(0)).join(","),
+              "hasEnd:", streamContent.includes(TOOL_CALL_END)
+            );
+          }
           if (finalContent) writeChunk(chunk({ role: "assistant", content: finalContent }, null));
           if (finalToolCalls.length) {
             writeChunk(chunk({ tool_calls: finalToolCalls }, null));

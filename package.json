@@ -1,6 +1,6 @@
 {
   "name": "dsh-xl-free-model",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "description": "XL Free Model — 在 dsh 里装上这个插件即可自动运行本地 OpenAI 兼容代理，经 OpenCode 免费通道使用 mimo-v2.6-flash-free 等 free 模型；模型直接注册到会话模型选择列表（provider: xl-free-model），无需 profile 手工配置 provider；设置页含 XL Free Model 插页展示代理状态；支持流式、多轮会话复用与 function calling 桥接。",
