@@ -7,9 +7,33 @@
  * vocabulary: block-start / deltas / block-end / usage / finish.
  */
 
+import crypto from "node:crypto";
+
 const PROVIDER = "xl-free-model";
 const PROVIDER_LABEL = "XL Free Model";
 const FALLBACK_MODELS = ["mimo-v2.6-flash-free"];
+
+// Matches dsh-llm-pi-ai's DEFAULT_CONTEXT_WINDOW / DEFAULT_MAX_TOKENS.
+const DEFAULT_CONTEXT_WINDOW = 262144;
+const DEFAULT_MAX_TOKENS = 32768;
+
+/** Lazy attribution headers; dsh-llm is resolved only on first call so hot
+ *  reload does not fail on static @deepseek-ai/* imports. */
+async function attributionHeaders() {
+  try {
+    const mod = await import("@deepseek-ai/dsh-llm");
+    const headers = typeof mod.attributionHeaders === "function" ? mod.attributionHeaders() : undefined;
+    if (headers && typeof headers === "object") return headers;
+  } catch {
+    /* kernel helper unavailable — fall through */
+  }
+  return { "user-agent": "deepseek-harness/1.0.0 (+https://github.com/deepseek-ai/deepseek-harness)" };
+}
+
+/** Mint a tool-call id for calls that stream arguments without one. */
+function mintToolCallId() {
+  return `call_${crypto.randomBytes(12).toString("hex")}`;
+}
 
 function blocksText(blocks) {
   if (!Array.isArray(blocks)) return "";
@@ -20,12 +44,151 @@ function blocksText(blocks) {
   return parts.join("\n");
 }
 
+/**
+ * dsh injects the session workspace as a runtime-context message whose section
+ * text is `Current working directory: "<JSON-quoted absolute path>".` The
+ * proxy needs this per request: OpenCode's native tool permission root and its
+ * environment block are derived from the CLI process cwd, not from the
+ * `directory=` query parameter.
+ */
+function parseWorkingDirectoryText(text) {
+  if (typeof text !== "string" || text === "") return null;
+  const match = text.match(/Current working directory:\s*("(?:[^"\\]|\\.)*")/);
+  if (!match) return null;
+  try {
+    const value = JSON.parse(match[1]);
+    return typeof value === "string" && value !== "" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function workingDirectoryOf(messages) {
+  if (!Array.isArray(messages)) return null;
+  // Runtime-context snapshots supersede earlier ones, so scan newest first and
+  // prefer the structured section over a text scrape.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg) continue;
+    const source = msg.source || (msg.data && msg.data.source);
+    if (source && source.kind === "runtime-context" && Array.isArray(source.sections)) {
+      for (const section of source.sections) {
+        if (section && section.name === "working-directory:current") {
+          const parsed = parseWorkingDirectoryText(section.text);
+          if (parsed) return parsed;
+        }
+      }
+    }
+    const text =
+      typeof msg.content === "string" ? msg.content : blocksText(msg.content);
+    const parsed = parseWorkingDirectoryText(text);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function toolResultsOf(msg) {
+  if (msg && msg.role === "tool") {
+    const callId = (msg.source && msg.source.callId) || msg.toolCallId || "";
+    return callId === ""
+      ? []
+      : [{ callId, content: msg.content, isError: msg.isError === true }];
+  }
+  const out = [];
+  for (const b of Array.isArray(msg && msg.content) ? msg.content : []) {
+    if (b && b.type === "tool-result") {
+      const callId =
+        b.toolCallId || (msg.source && msg.source.callId) || "";
+      if (callId !== "") {
+        out.push({ callId, content: b.content, isError: b.isError === true });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Drop tool calls that were never answered, and answers with no call.
+ *
+ * A turn aborted between the call and its result leaves exactly that in the
+ * durable history; an OpenAI wire answers such a payload 400 and then fails
+ * every later turn of the session — the same shape the reference projector
+ * (repairToolPairing) repairs before any wire sees it.
+ */
+function repairToolPairing(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const answered = new Set();
+  for (const msg of list) {
+    for (const r of toolResultsOf(msg)) answered.add(r.callId);
+  }
+
+  const keptCalls = new Set();
+  const out = [];
+  for (const msg of list) {
+    const role = msg && msg.role;
+    const results = toolResultsOf(msg);
+    if (results.length > 0) {
+      if (role === "tool") {
+        if (keptCalls.has(results[0].callId)) out.push(msg);
+        continue;
+      }
+      const kept = new Set(
+        results.filter((r) => keptCalls.has(r.callId)).map((r) => r.callId)
+      );
+      const blocks = Array.isArray(msg.content) ? msg.content : [];
+      const rest = blocks.filter(
+        (b) =>
+          !b ||
+          b.type !== "tool-result" ||
+          kept.has(b.toolCallId || (msg.source && msg.source.callId) || "")
+      );
+      if (rest.length === blocks.length) out.push(msg);
+      else if (rest.length > 0) out.push({ ...msg, content: rest });
+      continue;
+    }
+    if (role === "tool") continue; // answer with no resolvable call id
+    if (role !== "assistant") {
+      out.push(msg);
+      continue;
+    }
+    const blocks = Array.isArray(msg.content) ? msg.content : [];
+    const toolBlocks = blocks.filter((b) => b && b.type === "tool-call");
+    // A nameless call is not executable — the host answers it as an error
+    // *and keeps it in history*, so it 400s every later turn too.
+    const calls = toolBlocks.filter(
+      (b) => answered.has(String(b.id ?? "")) && String(b.name ?? "") !== ""
+    );
+    for (const call of calls) keptCalls.add(String(call.id));
+    if (calls.length === toolBlocks.length) {
+      if (calls.length > 0 || blocks.some((b) => b && b.type === "text" && b.text)) {
+        out.push(msg);
+      }
+      continue;
+    }
+    if (calls.length === 0) {
+      if (blocks.some((b) => b && b.type === "text" && b.text)) {
+        out.push({
+          ...msg,
+          content: blocks.filter((b) => !b || b.type !== "tool-call"),
+        });
+      }
+      continue;
+    }
+    out.push({
+      ...msg,
+      content: blocks.filter((b) => !b || b.type !== "tool-call" || calls.includes(b)),
+    });
+  }
+  return out;
+}
+
 function toOpenAiMessages(messages, system) {
   const out = [];
   if (typeof system === "string" && system !== "") {
     out.push({ role: "system", content: system });
   }
-  for (const msg of messages ?? []) {
+  const list = repairToolPairing(messages);
+  for (const msg of list) {
     const role = msg.role;
     if (role === "system" || role === "developer") {
       const text = blocksText(msg.content);
@@ -33,8 +196,17 @@ function toOpenAiMessages(messages, system) {
       continue;
     }
     if (role === "user") {
-      const text = blocksText(msg.content);
-      out.push({ role: "user", content: text });
+      const results = toolResultsOf(msg);
+      // One wire turn carries the answers first, then the user text — the
+      // split the kernel adapter itself makes when a tool returned nothing.
+      for (const r of results) {
+        out.push({ role: "tool", tool_call_id: r.callId, content: blocksText(r.content) || "(no output)" });
+      }
+      const present = Array.isArray(msg.content)
+        ? msg.content.filter((b) => b && b.type !== "tool-result")
+        : msg.content;
+      const text = Array.isArray(present) ? blocksText(present) : present;
+      if (!results.length || text) out.push({ role: "user", content: text || "" });
       continue;
     }
     if (role === "assistant") {
@@ -46,7 +218,13 @@ function toOpenAiMessages(messages, system) {
             toolCalls.push({
               id: b.id || "",
               type: "function",
-              function: { name: b.name || "", arguments: b.arguments || "" },
+              function: {
+                name: b.name || "",
+                arguments:
+                  typeof b.arguments === "string" && b.arguments !== ""
+                    ? b.arguments
+                    : "{}",
+              },
             });
           }
         }
@@ -58,10 +236,11 @@ function toOpenAiMessages(messages, system) {
     }
     if (role === "tool") {
       const callId = (msg.source && msg.source.callId) || msg.toolCallId || "";
+      if (callId === "") continue;
       out.push({
         role: "tool",
         tool_call_id: callId,
-        content: blocksText(msg.content),
+        content: blocksText(msg.content) || "(no output)",
       });
       continue;
     }
@@ -92,24 +271,16 @@ function finishFromToken(token) {
  * dsh-llm normalizeLlmFailure, so the terminal finish chunk carries a typed
  * provider failure instead of `code: UNKNOWN`.
  */
-function streamFailure(message, code) {
+function streamFailure(message, code, status) {
   const err = new Error(message);
   err.code = code;
-  err.failure = { message, code };
-  return err;
-}
-
-async function resolveUserAgent() {
-  try {
-    const mod = await import("@deepseek-ai/dsh-llm");
-    const headers =
-      typeof mod.attributionHeaders === "function" ? mod.attributionHeaders() : undefined;
-    const ua = headers && (headers["user-agent"] || headers["User-Agent"]);
-    if (typeof ua === "string" && ua !== "") return ua;
-  } catch {
-    /* kernel helper unavailable — fall through */
+  const failure = { message, code };
+  if (Number.isInteger(status) && status >= 100 && status <= 599) {
+    failure.status = status;
+    err.status = status;
   }
-  return "dsh-xl-free-model/1.2.0";
+  err.failure = failure;
+  return err;
 }
 
 export class XlFreeModelAdapter {
@@ -117,7 +288,6 @@ export class XlFreeModelAdapter {
     this.port = port;
     this.apiKey = apiKey;
     this.logger = logger;
-    this.userAgent = null;
     this.modelsCache = { time: 0, list: null };
   }
 
@@ -152,7 +322,10 @@ export class XlFreeModelAdapter {
     }
     try {
       const res = await fetch(`http://127.0.0.1:${this.port}/v1/models`, {
-        headers: { authorization: `Bearer ${this.apiKey}` },
+        headers: {
+          authorization: `Bearer ${this.apiKey}`,
+          ...(await attributionHeaders()),
+        },
         signal: AbortSignal.timeout(4000),
       });
       if (res.ok) {
@@ -182,7 +355,7 @@ export class XlFreeModelAdapter {
     }));
   }
 
-  async resolveModel(provider, model) {
+  async resolveModel(provider, model, _signal) {
     // Never throw — a rejected resolveModel turns the whole provider into a
     // picker failure group (buildModelCatalog isolates per-provider errors).
     const id = typeof model === "string" && model !== "" ? model : FALLBACK_MODELS[0];
@@ -190,58 +363,132 @@ export class XlFreeModelAdapter {
       provider,
       id,
       name: id,
-      context: { contextWindow: 131072 },
-      defaultMaxTokens: 8192,
+      context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
+      defaultMaxTokens: DEFAULT_MAX_TOKENS,
       inputModalities: ["text"],
     };
   }
 
-  async prepareCall(provider, model) {
+  async prepareCall(provider, model, signal) {
     return {
-      model: await this.resolveModel(provider, model),
+      model: await this.resolveModel(provider, model, signal),
       stream: (options) => this.stream(options),
     };
   }
 
   async * stream(options) {
-    if (!this.userAgent) this.userAgent = await resolveUserAgent();
-
     const body = {
       model: options.model,
       messages: toOpenAiMessages(options.messages, options.system),
       stream: true,
+      // Ask the proxy for the final usage chunk; without it the harness never
+      // receives token accounting for the turn.
+      stream_options: { include_usage: true },
     };
     const tools = toOpenAiTools(options.tools);
     if (tools) body.tools = tools;
     if (typeof options.temperature === "number") body.temperature = options.temperature;
     if (typeof options.maxTokens === "number") body.max_tokens = options.maxTokens;
+    if (Array.isArray(options.stop) && options.stop.length) {
+      const list = options.stop.filter((s) => typeof s === "string" && s !== "");
+      if (list.length) body.stop = list;
+    }
+    if (typeof options.reasoningEffort === "string" && options.reasoningEffort !== ""
+      && options.reasoningEffort !== "off" && options.reasoningEffort !== "none") {
+      body.reasoning_effort = options.reasoningEffort;
+    }
 
+    const headers = {
+      "content-type": "application/json",
+      authorization: `Bearer ${this.apiKey}`,
+      ...(await attributionHeaders()),
+    };
+    const workingDirectory = workingDirectoryOf(options.messages);
+    if (workingDirectory) {
+      // Percent-encoded so non-ASCII workspace paths remain a legal header.
+      headers["x-dsh-working-directory"] = encodeURIComponent(workingDirectory);
+    }
     const res = await fetch(`http://127.0.0.1:${this.port}/v1/chat/completions`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.apiKey}`,
-        "user-agent": this.userAgent,
-      },
+      headers,
       body: JSON.stringify(body),
       signal: options.signal,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw streamFailure(
-        `proxy HTTP ${res.status}: ${text.slice(0, 400)}`,
-        "PROXY_HTTP_" + res.status
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch { /* keep null */ }
+      const payload = parsed && parsed.error ? parsed.error : null;
+      const detail = payload && payload.message ? String(payload.message) : text.slice(0, 400);
+      const err = streamFailure(
+        `proxy HTTP ${res.status}: ${detail}`,
+        (payload && typeof payload.code === "string" && payload.code !== "" && payload.code) ||
+          "PROXY_HTTP_" + res.status,
+        (payload && payload.status) || res.status
       );
+      if (payload) {
+        err.opencode = payload.opencode ?? null;
+        err.sessionId = payload.sessionId ?? null;
+        err.backend = payload.backend ?? null;
+        err.backendSource = payload.backendSource ?? null;
+        err.model = payload.model ?? null;
+      }
+      throw err;
     }
 
     const blocks = new Map();
     let nextIndex = 0;
     const emitQueue = [];
-    const openBlockQ = (kind) => {
-      for (const b of blocks.values()) if (b.kind === kind && !b.closed) return b;
-      const block = { index: nextIndex++, kind, text: "", id: "", name: "", args: "", closed: false };
+    const toolBlocksByIndex = new Map();
+    let lastToolBlock = null;
+
+    const createBlock = (kind, id) => {
+      const block = {
+        index: nextIndex++,
+        kind,
+        text: "",
+        id: id || "",
+        name: "",
+        args: "",
+        closed: false,
+      };
       blocks.set(block.index, block);
       emitQueue.push({ type: "block-start", index: block.index, blockType: kind });
+      return block;
+    };
+
+    // Text and reasoning are single logical blocks per turn.
+    const openBlockQ = (kind) => {
+      for (const b of blocks.values()) if (b.kind === kind && !b.closed) return b;
+      return createBlock(kind);
+    };
+
+    // Parallel tool calls stream as several independent argument strings. The
+    // OpenAI delta `index` is the stable identity; the id is the fallback, and
+    // an argument-only continuation without either belongs to the last call.
+    const openToolCallBlock = (call) => {
+      const callIndex = call && Number.isInteger(call.index) ? call.index : null;
+      const callId = call && typeof call.id === "string" && call.id !== "" ? call.id : "";
+      if (callIndex !== null) {
+        const existing = toolBlocksByIndex.get(callIndex);
+        if (existing && !existing.closed) return existing;
+      }
+      if (callId !== "") {
+        for (const b of blocks.values()) {
+          if (b.kind === "tool-call" && !b.closed && b.id === callId) {
+            if (callIndex !== null) toolBlocksByIndex.set(callIndex, b);
+            return b;
+          }
+        }
+      }
+      if (callIndex === null && callId === "" && lastToolBlock && !lastToolBlock.closed) {
+        return lastToolBlock;
+      }
+      // Mint a stand-in id so an id-less call can still be paired with its
+      // result on the next turn; a provider id arriving later overrides it.
+      const block = createBlock("tool-call", callId || mintToolCallId());
+      if (callIndex !== null) toolBlocksByIndex.set(callIndex, block);
+      lastToolBlock = block;
       return block;
     };
 
@@ -270,7 +517,13 @@ export class XlFreeModelAdapter {
           typeof payload.error.code === "string" && payload.error.code !== ""
             ? payload.error.code
             : "PROXY_STREAM_ERROR";
-        pendingError = streamFailure(message, code);
+        pendingError = streamFailure(message, code, payload.error.status || undefined);
+        pendingError.opencode = payload.error.opencode ?? null;
+        pendingError.sessionId = payload.error.sessionId ?? null;
+        pendingError.backend = payload.error.backend ?? null;
+        pendingError.backendSource = payload.error.backendSource ?? null;
+        pendingError.model = payload.error.model ?? null;
+        // 标记错误状态，确保后续 throw pendingError 时能携全错误链转发给 dsh
         reader.cancel().catch(() => {});
         return;
       }
@@ -298,16 +551,18 @@ export class XlFreeModelAdapter {
           emitQueue.push({ type: "text-delta", index: b.index, text: delta.content });
         }
         for (const call of delta.tool_calls ?? []) {
-          const b = openBlockQ("tool-call");
+          const b = openToolCallBlock(call);
           if (call.id) b.id = call.id;
-          if (call.function && call.function.name) b.name = call.function.name;
-          if (call.function && call.function.arguments) b.args += call.function.arguments;
+          const name = call.function && call.function.name ? call.function.name : "";
+          const argsDelta = (call.function && call.function.arguments) || "";
+          if (name) b.name = name;
+          if (argsDelta) b.args += argsDelta;
           emitQueue.push({
             type: "tool-call-delta",
             index: b.index,
             id: b.id,
-            name: call.function && call.function.name ? call.function.name : undefined,
-            argumentsDelta: (call.function && call.function.arguments) || "",
+            name: name || undefined,
+            argumentsDelta: argsDelta,
           });
         }
         if (choice.finish_reason) {
@@ -354,6 +609,20 @@ export class XlFreeModelAdapter {
           },
         };
       }
+    }
+    // 空回复兜底：代理若在没有内容、没有工具调用、也没有显式 error chunk 的情况下
+    // 结束流，这里必须变成一个可见的失败，而不是让 dsh 静默显示「无信息回复」。
+    const hasVisible = [...blocks.values()].some(
+      (b) =>
+        (b.kind === "text" && b.text !== "") ||
+        (b.kind === "reasoning" && b.text !== "") ||
+        b.kind === "tool-call"
+    );
+    if (!hasVisible) {
+      throw streamFailure(
+        "XL Free Model 代理返回了空回复（无文本、无工具调用、无错误信息），请检查 opencode 后端日志",
+        "PROXY_EMPTY_REPLY"
+      );
     }
     if (usage) yield { type: "usage", usage };
     if (!sawFinish) {

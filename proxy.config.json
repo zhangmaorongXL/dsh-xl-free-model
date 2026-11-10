@@ -3,13 +3,13 @@
     "proxyPort":  8787,
     "apiKey":  "changeme-dsh-key",
     "backend":  {
-                    "host":  "",
+                    "host":  "127.0.0.1",
                     "port":  0,
                     "username":  "opencode",
                     "password":  "",
                     "cli":  {
                                 "enabled":  true,
-                                "path":  "cli\\node_modules\\opencode-windows-x64\\bin\\opencode.exe",
+                                "path":  "CLI\\1.19.0\\node_modules\\opencode-windows-x64\\bin\\opencode.exe",
                                 "port":  4097
                             }
                 }

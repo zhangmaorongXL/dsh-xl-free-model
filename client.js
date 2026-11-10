@@ -20,8 +20,11 @@ window.__ModuleLoader__.load({
     const NS = "settings.xlFreeModel";
     const inject = ["slots", "locale"];
 
-    const PROXY = "http://127.0.0.1:8787";
-    const API_KEY = "changeme-dsh-key";
+    const PROXY =
+      (typeof globalThis !== "undefined" &&
+        typeof globalThis.__XL_FREE_MODEL_PROXY__ === "string" &&
+        globalThis.__XL_FREE_MODEL_PROXY__) ||
+      "http://127.0.0.1:8787";
 
     const DICT = {
       zh: {
@@ -40,10 +43,11 @@ window.__ModuleLoader__.load({
         retry: "重试",
         loading: "加载中…",
         loadFail: "无法获取模型列表：请确认代理已启动。",
-        count: (n) => `共 ${n} 个模型`,
+        count: "共 {n} 个模型",
         copied: "已复制",
         copy: "复制 ID",
         pickerNote: "模型已自动注册到会话的模型选择列表，无需额外配置。",
+        notSet: "未设置",
       },
       en: {
         nav: "XL Free Model",
@@ -61,12 +65,51 @@ window.__ModuleLoader__.load({
         retry: "Retry",
         loading: "Loading…",
         loadFail: "Cannot fetch models: make sure the proxy is running.",
-        count: (n) => `${n} models`,
+        count: "{n} models",
         copied: "Copied",
         copy: "Copy ID",
         pickerNote: "Models are auto-registered in the session model picker; no extra setup needed.",
+        notSet: "not set",
       },
     };
+
+    function buildDict(t) {
+      const translate = typeof t === "function" ? t : (key) => key;
+      const tr = (key, params) => {
+        const translated = translate(key, params);
+        // Locale dictionaries only cover zh/en; fall back to zh instead of
+        // showing raw keys when the active locale has no entry.
+        if (typeof translated === "string" && translated !== key) return translated;
+        const template = DICT.zh[key] ?? key;
+        return typeof params === "object" && params !== null
+          ? template.replace(/\{(\w+)\}/g, (match, name) =>
+              name in params ? String(params[name]) : match
+            )
+          : template;
+      };
+      return {
+        nav: tr("nav"),
+        title: tr("title"),
+        subtitle: tr("subtitle"),
+        statusOn: tr("statusOn"),
+        statusOff: tr("statusOff"),
+        statusUnknown: tr("statusUnknown"),
+        backend: tr("backend"),
+        baseUrl: tr("baseUrl"),
+        apiKey: tr("apiKey"),
+        modelsTitle: tr("modelsTitle"),
+        modelsHint: tr("modelsHint"),
+        refresh: tr("refresh"),
+        retry: tr("retry"),
+        loading: tr("loading"),
+        loadFail: tr("loadFail"),
+        count: (n) => tr("count", { n }),
+        copied: tr("copied"),
+        copy: tr("copy"),
+        pickerNote: tr("pickerNote"),
+        notSet: tr("notSet"),
+      };
+    }
 
     const CSS = `
 .xlfm-page { display: flex; flex-direction: column; gap: 20px; padding: 4px 0; color: var(--dsw-alias-text-primary, inherit); }
@@ -104,7 +147,10 @@ window.__ModuleLoader__.load({
 `;
 
     async function fetchJson(url, init) {
-      const res = await fetch(url, Object.assign({ signal: AbortSignal.timeout(5000) }, init || {}));
+      // A cold proxy may need to discover/start the OpenCode backend and warm
+      // its model list; 5s was too tight and surfaced "Failed to fetch"-style
+      // errors in the settings page.
+      const res = await fetch(url, Object.assign({ signal: AbortSignal.timeout(30000) }, init || {}));
       if (!res.ok) throw new Error("HTTP " + res.status);
       return res.json();
     }
@@ -150,26 +196,30 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function SettingsPage() {
+    function SettingsPage(props) {
       const [health, setHealth] = useState(null);
       const [models, setModels] = useState(null);
       const [error, setError] = useState(null);
       const [loading, setLoading] = useState(true);
-      const dict = DICT.zh;
+      const t = props && typeof props.t === "function" ? props.t : null;
+      const dict = useMemo(() => buildDict(t), [t]);
 
       const load = useCallback(async () => {
         setLoading(true);
         setError(null);
+        let key = "";
         try {
           const hres = await fetchJson(PROXY + "/health").catch(() => null);
           setHealth(hres);
+          if (hres && typeof hres.apiKey === "string") key = hres.apiKey;
         } catch {
           setHealth(null);
         }
         try {
-          const list = await fetchJson(PROXY + "/v1/models", {
-            headers: { authorization: "Bearer " + API_KEY },
-          });
+          const list = await fetchJson(
+            PROXY + "/v1/models",
+            key ? { headers: { authorization: "Bearer " + key } } : undefined
+          );
           setModels(Array.isArray(list.data) ? list.data : []);
         } catch (e) {
           setModels(null);
@@ -189,6 +239,15 @@ window.__ModuleLoader__.load({
         () => (models ? models.map((m) => m && m.id).filter(Boolean) : []),
         [models]
       );
+      const proxyBase =
+        (health && health.proxy && typeof health.proxy.baseUrl === "string" && health.proxy.baseUrl) ||
+        PROXY;
+      const apiKeyLabel =
+        health && typeof health.apiKey === "string" && health.apiKey
+          ? health.apiKey
+          : health && health.hasApiKey
+            ? "••••••••"
+            : dict.notSet;
 
       return h(
         "div",
@@ -206,9 +265,9 @@ window.__ModuleLoader__.load({
           "dl",
           { className: "xlfm-meta" },
           h("dt", null, dict.baseUrl),
-          h("dd", null, PROXY + "/v1"),
+          h("dd", null, proxyBase + "/v1"),
           h("dt", null, dict.apiKey),
-          h("dd", null, API_KEY)
+          h("dd", null, apiKeyLabel)
         ),
         h(
           "div",
@@ -241,7 +300,7 @@ window.__ModuleLoader__.load({
                     h(ModelCard, { key: id, id, copyLabel: dict.copy, copiedLabel: dict.copied })
                   )
                 )
-              : h("p", { className: "xlfm-msg" }, dict.loadFail)
+              : h("p", { className: "xlfm-msg" }, error ? dict.loadFail + " (" + error + ")" : dict.loadFail)
         ),
         h("p", { className: "xlfm-hint" }, dict.pickerNote)
       );
@@ -269,6 +328,7 @@ window.__ModuleLoader__.load({
             order: 36,
             label: () => t("nav"),
             locale: NS,
+            inject: () => ({ t }),
           },
           (props) => h(SettingsPage, Object.assign({}, props))
         )

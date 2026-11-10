@@ -135,7 +135,19 @@ Add-Type -TypeDefinition $src -Language CSharp -ErrorAction Stop
 
 $pids = @()
 if ($Pid_ -gt 0) { $pids = @($Pid_) }
-else { $pids = [PebEnv]::PidsOfImage("OpenCode.exe") }
+else {
+  # The desktop app may be OpenCode.exe (Electron) while its bundled runtime is
+  # opencode-cli.exe; older/standalone installs use opencode.exe. Scan all.
+  $seen = @{}
+  foreach ($image in @("OpenCode.exe", "opencode-cli.exe", "opencode.exe")) {
+    foreach ($procId in [PebEnv]::PidsOfImage($image)) {
+      if (-not $seen.ContainsKey($procId)) {
+        $seen[$procId] = $true
+        $pids += $procId
+      }
+    }
+  }
+}
 
 foreach ($procId in $pids) {
   $val = [PebEnv]::Get($Key, $procId)
