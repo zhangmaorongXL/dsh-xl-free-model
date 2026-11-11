@@ -17,6 +17,59 @@ const FALLBACK_MODELS = ["mimo-v2.6-flash-free"];
 const DEFAULT_CONTEXT_WINDOW = 262144;
 const DEFAULT_MAX_TOKENS = 32768;
 
+// OpenCode exposes reasoning levels as model variants. Present the backend's
+// own ids (in backend order, least to greatest) so dsh's picker can offer
+// exactly the levels the selected model supports.
+const EFFORT_LABELS = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+};
+
+function variantIdOf(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && typeof value.id === "string") return value.id;
+  return "";
+}
+
+/**
+ * OpenCode 2.x returns `variants` as an array of `{ id, settings }`; 1.x
+ * returns an object keyed by variant id. Accept both shapes.
+ */
+function variantIdsOf(value) {
+  const ids = [];
+  const push = (candidate) => {
+    const id = variantIdOf(candidate);
+    if (id !== "" && !ids.includes(id)) ids.push(id);
+  };
+  if (Array.isArray(value)) {
+    for (const candidate of value) push(candidate);
+  } else if (value && typeof value === "object") {
+    for (const key of Object.keys(value)) push(key);
+  }
+  return ids;
+}
+
+function reasoningOf(entry) {
+  if (!entry || !Array.isArray(entry.variants) || entry.variants.length === 0) {
+    return undefined;
+  }
+  const efforts = entry.variants.map((id) => ({
+    id,
+    name: EFFORT_LABELS[id.toLowerCase()] || id,
+  }));
+  if (entry.defaultEffort && efforts.some((effort) => effort.id === entry.defaultEffort)) {
+    return { efforts, defaultEffort: entry.defaultEffort };
+  }
+  // No explicit backend default: dsh adds a "provider default" choice, which
+  // is exactly OpenCode's behavior when the session carries no variant.
+  return { efforts };
+}
+
 /** Lazy attribution headers; dsh-llm is resolved only on first call so hot
  *  reload does not fail on static @deepseek-ai/* imports. */
 async function attributionHeaders() {
@@ -288,12 +341,67 @@ export class XlFreeModelAdapter {
     this.port = port;
     this.apiKey = apiKey;
     this.logger = logger;
-    this.modelsCache = { time: 0, list: null };
+    this.modelsCache = { time: 0, list: null, failedAt: 0 };
+    this.modelsPromise = null;
   }
 
   log(level, message) {
     const fn = this.logger && this.logger[level];
     if (typeof fn === "function") fn.call(this.logger, message);
+  }
+
+  /**
+   * Fetch the proxy's model list once per 30s window and keep the reasoning
+   * metadata alongside the ids. A failed lookup keeps the previous list and
+   * cools down for 5s so `resolveModel()` isn't repeated for every model on a
+   * cold/failed proxy.
+   */
+  async fetchModels() {
+    const now = Date.now();
+    if (this.modelsCache.list && now - this.modelsCache.time < 30000) {
+      return this.modelsCache.list;
+    }
+    if (now - this.modelsCache.failedAt < 5000) {
+      return this.modelsCache.list || null;
+    }
+    if (this.modelsPromise) return this.modelsPromise;
+
+    this.modelsPromise = (async () => {
+      const previous = this.modelsCache.list;
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.port}/v1/models`, {
+          headers: {
+            authorization: `Bearer ${this.apiKey}`,
+            ...(await attributionHeaders()),
+          },
+          signal: AbortSignal.timeout(4000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json();
+        const list = [];
+        for (const model of Array.isArray(body.data) ? body.data : []) {
+          if (!model || typeof model.id !== "string" || model.id === "") continue;
+          list.push({
+            id: model.id,
+            name:
+              typeof model.name === "string" && model.name !== "" ? model.name : model.id,
+            variants: variantIdsOf(model.variants),
+            defaultEffort:
+              variantIdOf(model.default_variant) || variantIdOf(model.defaultVariant) || null,
+          });
+        }
+        if (list.length === 0) throw new Error("proxy returned no models");
+        this.modelsCache = { time: Date.now(), list, failedAt: 0 };
+        return list;
+      } catch (e) {
+        this.log("debug", `listModels proxy fetch failed: ${e && e.message}`);
+        this.modelsCache = { ...this.modelsCache, failedAt: Date.now() };
+        return previous || null;
+      } finally {
+        this.modelsPromise = null;
+      }
+    })();
+    return this.modelsPromise;
   }
 
   providerInfo(provider) {
@@ -311,46 +419,20 @@ export class XlFreeModelAdapter {
   }
 
   async listModels(provider) {
-    const now = Date.now();
-    if (this.modelsCache.list && now - this.modelsCache.time < 30000) {
-      return this.modelsCache.list.map((id) => ({
-        provider,
-        id,
-        name: id,
-        inputModalities: ["text"],
-      }));
-    }
-    try {
-      const res = await fetch(`http://127.0.0.1:${this.port}/v1/models`, {
-        headers: {
-          authorization: `Bearer ${this.apiKey}`,
-          ...(await attributionHeaders()),
-        },
-        signal: AbortSignal.timeout(4000),
-      });
-      if (res.ok) {
-        const body = await res.json();
-        const ids = (Array.isArray(body.data) ? body.data : [])
-          .map((m) => m && m.id)
-          .filter((id) => typeof id === "string" && id !== "");
-        if (ids.length) {
-          this.modelsCache = { time: now, list: ids };
-          return ids.map((id) => ({
-            provider,
+    const entries = await this.fetchModels();
+    const list =
+      entries && entries.length
+        ? entries
+        : FALLBACK_MODELS.map((id) => ({
             id,
             name: id,
-            inputModalities: ["text"],
+            variants: [],
+            defaultEffort: null,
           }));
-        }
-      }
-    } catch (e) {
-      this.log("debug", `listModels proxy fetch failed: ${e && e.message}`);
-    }
-    // Always return at least the fallback so the provider group never goes empty.
-    return FALLBACK_MODELS.map((id) => ({
+    return list.map((entry) => ({
       provider,
-      id,
-      name: id,
+      id: entry.id,
+      name: entry.name || entry.id,
       inputModalities: ["text"],
     }));
   }
@@ -359,14 +441,21 @@ export class XlFreeModelAdapter {
     // Never throw — a rejected resolveModel turns the whole provider into a
     // picker failure group (buildModelCatalog isolates per-provider errors).
     const id = typeof model === "string" && model !== "" ? model : FALLBACK_MODELS[0];
-    return {
+    const entries = await this.fetchModels();
+    const entry = entries ? entries.find((candidate) => candidate.id === id) : null;
+    const resolved = {
       provider,
       id,
-      name: id,
+      name: entry && entry.name ? entry.name : id,
       context: { contextWindow: DEFAULT_CONTEXT_WINDOW },
       defaultMaxTokens: DEFAULT_MAX_TOKENS,
       inputModalities: ["text"],
     };
+    // Only declare reasoning when the backend actually exposes variants for
+    // this exact model; otherwise dsh would offer levels the model rejects.
+    const reasoning = reasoningOf(entry);
+    if (reasoning) resolved.reasoning = reasoning;
+    return resolved;
   }
 
   async prepareCall(provider, model, signal) {
@@ -393,9 +482,12 @@ export class XlFreeModelAdapter {
       const list = options.stop.filter((s) => typeof s === "string" && s !== "");
       if (list.length) body.stop = list;
     }
-    if (typeof options.reasoningEffort === "string" && options.reasoningEffort !== ""
-      && options.reasoningEffort !== "off" && options.reasoningEffort !== "none") {
-      body.reasoning_effort = options.reasoningEffort;
+    // Forward every declared level, including `none`: OpenCode's variant ids
+    // are not OpenAI's off/none aliases, so dropping them would silently fall
+    // back to the provider default. dsh already validates the id against the
+    // efforts returned by resolveModel().
+    if (typeof options.reasoningEffort === "string" && options.reasoningEffort.trim() !== "") {
+      body.reasoning_effort = options.reasoningEffort.trim();
     }
 
     const headers = {

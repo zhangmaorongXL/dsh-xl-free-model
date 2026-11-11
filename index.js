@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { XlFreeModelAdapter, PROVIDER } from "./adapter.js";
 
 export const name = "dsh-xl-free-model";
-export const version = "1.8.0";
+export const version = "1.9.0";
 export const inject = ["llm"];
 
 const here = path.dirname(fileURLToPath(import.meta.url));

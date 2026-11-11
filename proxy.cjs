@@ -1332,6 +1332,61 @@ function readBody(req) {
 
 // ---------- models ----------
 
+function variantIdOf(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && typeof value.id === "string") return value.id;
+  return "";
+}
+
+/** 2.x publishes variants as `[{ id, settings }]`; 1.x as an object keyed by id. */
+function variantIdsOf(value) {
+  const ids = [];
+  const push = (candidate) => {
+    const id = variantIdOf(candidate);
+    if (id !== "" && !ids.includes(id)) ids.push(id);
+  };
+  if (Array.isArray(value)) {
+    for (const candidate of value) push(candidate);
+  } else if (value && typeof value === "object") {
+    for (const key of Object.keys(value)) push(key);
+  }
+  return ids;
+}
+
+function modelCreatedSeconds(model) {
+  if (model && model.time && typeof model.time.released === "number") {
+    return Math.floor(model.time.released / 1000);
+  }
+  if (model && typeof model.release_date === "string" && model.release_date !== "") {
+    const time = new Date(model.release_date + "T00:00:00Z").getTime();
+    if (Number.isFinite(time)) return Math.floor(time / 1000);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Keep the OpenAI model shape, but expose the fields the dsh adapter needs to
+ * mirror OpenCode's reasoning levels (variants) instead of guessing them.
+ */
+function toWireModel(model, fallbackProvider) {
+  if (!model || typeof model.id !== "string" || model.id === "") return null;
+  const wire = {
+    id: model.id,
+    object: "model",
+    created: modelCreatedSeconds(model),
+    owned_by: model.providerID || fallbackProvider,
+    name: typeof model.name === "string" && model.name !== "" ? model.name : model.id,
+  };
+  const variants = variantIdsOf(model.variants);
+  if (variants.length) wire.variants = variants;
+  const defaultVariant =
+    variantIdOf(model.defaultVariant) || variantIdOf(model.default_variant);
+  if (defaultVariant !== "" && variants.includes(defaultVariant)) {
+    wire.default_variant = defaultVariant;
+  }
+  return wire;
+}
+
 async function listModels(b) {
   if (apiOf(b) === "v2") {
     const r = await backendJsonWith(b, "GET", "/api/model?" + dirQuery(b.dir || DIRECTORY));
@@ -1344,14 +1399,8 @@ async function listModels(b) {
     const list = Array.isArray(r.json.data) ? r.json.data : [];
     return list
       .filter((m) => m && m.providerID === PROVIDER_ID && m.enabled !== false)
-      .map((m) => ({
-        id: m.id,
-        object: "model",
-        created: Math.floor(
-          (m.time && typeof m.time.released === "number" ? m.time.released : Date.now()) / 1000
-        ),
-        owned_by: m.providerID,
-      }));
+      .map((m) => toWireModel(m, PROVIDER_ID))
+      .filter(Boolean);
   }
 
   const r = await backendJsonWith(b, "GET", "/config/providers?" + dirQuery(b.dir || DIRECTORY));
@@ -1364,14 +1413,7 @@ async function listModels(b) {
   const providers = r.json.providers || [];
   const oc = providers.find((p) => p.id === PROVIDER_ID);
   const models = oc ? Object.values(oc.models || {}) : [];
-  return models.map((m) => ({
-    id: m.id,
-    object: "model",
-    created: Math.floor(
-      (m.release_date ? new Date(m.release_date + "T00:00:00Z").getTime() : Date.now()) / 1000
-    ),
-    owned_by: PROVIDER_ID,
-  }));
+  return models.map((m) => toWireModel(m, PROVIDER_ID)).filter(Boolean);
 }
 
 async function prefetchModels() {
@@ -1497,8 +1539,14 @@ function buildPromptBody(systemText, parts, body) {
     tools: { ...GATEWAY_SAFE_TOOLS },
   };
   if (systemText) prompt.system = systemText;
-  if (body.reasoning_effort && ["low", "medium", "high"].includes(body.reasoning_effort)) {
-    prompt.variant = body.reasoning_effort;
+  // OpenCode variants are not limited to low/medium/high: free models also
+  // expose none/minimal/xhigh/max. Pass any declared id through; unsupported
+  // ids are surfaced by the backend instead of being silently downgraded.
+  if (
+    typeof body.reasoning_effort === "string" &&
+    body.reasoning_effort.trim() !== ""
+  ) {
+    prompt.variant = body.reasoning_effort.trim();
   }
   return prompt;
 }
@@ -2103,12 +2151,13 @@ async function handleChatCompletion(req, res, body) {
   }
 
   const model = normalizeModel(body.model);
+  // `reasoning_effort` carries an OpenCode variant id here, not OpenAI's
+  // off/none alias. Keep `none` (a real variant on several free models) and
+  // let createSession() fall back to the provider default if the backend
+  // rejects an unknown id.
   const variant =
-    typeof body.reasoning_effort === "string" &&
-    body.reasoning_effort !== "" &&
-    body.reasoning_effort !== "none" &&
-    body.reasoning_effort !== "off"
-      ? body.reasoning_effort
+    typeof body.reasoning_effort === "string" && body.reasoning_effort.trim() !== ""
+      ? body.reasoning_effort.trim()
       : null;
   const stream = !!body.stream;
   const includeUsage = !!(body.stream_options && body.stream_options.include_usage);

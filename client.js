@@ -46,7 +46,8 @@ window.__ModuleLoader__.load({
         count: "共 {n} 个模型",
         copied: "已复制",
         copy: "复制 ID",
-        pickerNote: "模型已自动注册到会话的模型选择列表，无需额外配置。",
+        levels: "推理等级",
+        pickerNote: "模型已自动注册到会话的模型选择列表；支持推理等级的模型可在选择器中切换档位。",
         notSet: "未设置",
       },
       en: {
@@ -68,7 +69,8 @@ window.__ModuleLoader__.load({
         count: "{n} models",
         copied: "Copied",
         copy: "Copy ID",
-        pickerNote: "Models are auto-registered in the session model picker; no extra setup needed.",
+        levels: "Reasoning levels",
+        pickerNote: "Models are auto-registered in the session model picker; models with reasoning support expose a level selector there.",
         notSet: "not set",
       },
     };
@@ -106,6 +108,7 @@ window.__ModuleLoader__.load({
         count: (n) => tr("count", { n }),
         copied: tr("copied"),
         copy: tr("copy"),
+        levels: tr("levels"),
         pickerNote: tr("pickerNote"),
         notSet: tr("notSet"),
       };
@@ -142,6 +145,9 @@ window.__ModuleLoader__.load({
 .xlfm-copy:hover { background: var(--dsw-alias-bg-secondary, rgba(127,127,127,.12)); color: var(--dsw-alias-text-primary, inherit); }
 .xlfm-copy.done { opacity: 1; color: var(--dsw-static-green-500, #22c55e); }
 .xlfm-card-tag { font-size: 11px; color: var(--dsw-alias-text-secondary, #888); }
+.xlfm-levels { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.xlfm-levels-label { font-size: 11px; color: var(--dsw-alias-text-secondary, #888); }
+.xlfm-level { font-family: ui-monospace, monospace; font-size: 10.5px; line-height: 1.5; padding: 0 6px; border-radius: 999px; color: var(--dsw-alias-text-secondary, #888); background: var(--dsw-alias-bg-tertiary, rgba(127,127,127,.12)); }
 .xlfm-msg { font-size: 13px; color: var(--dsw-alias-text-secondary, #888); padding: 12px 0; }
 .xlfm-footer { display: flex; align-items: center; gap: 12px; }
 `;
@@ -155,7 +161,7 @@ window.__ModuleLoader__.load({
       return res.json();
     }
 
-    function ModelCard({ id, copyLabel, copiedLabel }) {
+    function ModelCard({ id, variants, levelsLabel, copyLabel, copiedLabel }) {
       const [copied, setCopied] = useState(false);
       const onCopy = useCallback(() => {
         const text = id;
@@ -192,7 +198,17 @@ window.__ModuleLoader__.load({
             copied ? "✓" : copyLabel
           )
         ),
-        h("span", { className: "xlfm-card-tag" }, "opencode · free")
+        h(
+          "div",
+          { className: "xlfm-levels" },
+          h("span", { className: "xlfm-card-tag" }, "opencode · free"),
+          variants && variants.length
+            ? h("span", { className: "xlfm-levels-label" }, "· " + levelsLabel)
+            : null,
+          (variants || []).map((level) =>
+            h("span", { className: "xlfm-level", key: level }, level)
+          )
+        )
       );
     }
 
@@ -235,8 +251,19 @@ window.__ModuleLoader__.load({
       const online = !!(health && health.healthy);
       const statusLabel = health == null ? dict.statusUnknown : online ? dict.statusOn : dict.statusOff;
       const dotClass = health == null ? "unknown" : online ? "on" : "off";
-      const modelIds = useMemo(
-        () => (models ? models.map((m) => m && m.id).filter(Boolean) : []),
+      const modelList = useMemo(
+        () =>
+          models
+            ? models
+                .map((m) => ({
+                  id: m && m.id,
+                  variants:
+                    m && Array.isArray(m.variants)
+                      ? m.variants.filter((level) => typeof level === "string" && level !== "")
+                      : [],
+                }))
+                .filter((m) => m.id)
+            : [],
         [models]
       );
       const proxyBase =
@@ -279,8 +306,8 @@ window.__ModuleLoader__.load({
               "h3",
               { className: "xlfm-section-title" },
               dict.modelsTitle,
-              modelIds.length
-                ? h("span", { className: "xlfm-count" }, dict.count(modelIds.length))
+              modelList.length
+                ? h("span", { className: "xlfm-count" }, dict.count(modelList.length))
                 : null
             ),
             h(
@@ -292,12 +319,19 @@ window.__ModuleLoader__.load({
           h("p", { className: "xlfm-hint" }, dict.modelsHint),
           loading && models == null
             ? h("p", { className: "xlfm-msg" }, dict.loading)
-            : modelIds.length
+            : modelList.length
               ? h(
                   "div",
                   { className: "xlfm-grid" },
-                  modelIds.map((id) =>
-                    h(ModelCard, { key: id, id, copyLabel: dict.copy, copiedLabel: dict.copied })
+                  modelList.map((model) =>
+                    h(ModelCard, {
+                      key: model.id,
+                      id: model.id,
+                      variants: model.variants,
+                      levelsLabel: dict.levels,
+                      copyLabel: dict.copy,
+                      copiedLabel: dict.copied,
+                    })
                   )
                 )
               : h("p", { className: "xlfm-msg" }, error ? dict.loadFail + " (" + error + ")" : dict.loadFail)

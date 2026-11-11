@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-11-11
+
+### Added
+
+- 模型推理等级（OpenCode `variants`）同步到 dsh：
+  - 代理 `/v1/models` 增加 `name` 与 `variants` 元数据，兼容 2.x 的数组形式和 1.x 的对象形式。
+  - 适配器 `resolveModel()` 返回 `reasoning.efforts`，dsh 的模型选择器和 agent 默认模型设置会自动显示对应推理等级。
+  - 设置页模型卡片显示每个模型可用的推理等级。
+
+### Changed
+
+- `reasoning_effort` 按 OpenCode variant id 原样透传，不再过滤 `none`，并支持 `minimal` / `xhigh` / `max` 等后端实际声明的等级；未选择等级时沿用后端默认 variant。
+
 ## [1.8.0] - 2026-11-10
 
 ### Added
@@ -92,5 +105,6 @@
 - 原生工具仅保留 `read`，`glob`、`grep`、`write`、`bash` 等通过 Function Calling 桥接执行。
 - 升级后建议重启 dsh，使插件和 `cordis.patch.yml` 完整生效。
 
-[Unreleased]: https://github.com/zhangmaorongXL/dsh-xl-free-model/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/zhangmaorongXL/dsh-xl-free-model/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/zhangmaorongXL/dsh-xl-free-model/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/zhangmaorongXL/dsh-xl-free-model/compare/1.5.0...v1.8.0

@@ -7,6 +7,7 @@
 ## 功能特性
 
 - **零配置模型接入**：安装插件后，免费模型自动出现在会话的模型选择列表
+- **推理等级同步**：模型在 OpenCode 后端声明的 `variants`（如 `none` / `low` / `high` / `max`）会作为 dsh 模型选择器中的推理等级出现；选中后经 `reasoning_effort` 透传到后端，未选择时使用后端默认等级
 - **本地代理**：OpenAI 兼容 API（`http://127.0.0.1:8787/v1`），可被任意 OpenAI SDK 调用
 - **自动管理**：dsh 启动时自动拉起代理，退出时自动清理
 - **桌面/无头双后端**：优先复用已打开的 OpenCode 桌面版；未打开时自动启动无头 CLI 后备
@@ -48,7 +49,8 @@
 
 1. 新建会话
 2. 在模型选择器中选择 `XL Free Model` 分组下的模型（如 `mimo-v2.6-flash-free`）
-3. 正常对话即可
+3. 若该模型支持推理等级，模型选择器会同时显示等级菜单，可按需切换；选择「提供方默认」则沿用 OpenCode 后端的默认等级
+4. 正常对话即可
 
 ### 独立使用代理
 
@@ -185,9 +187,9 @@ node proxy.cjs
 
 - `providerInfo(provider)` → `{ id, name }`
 - `listModels(provider)` → `LlmModelInfo[]`
-- `resolveModel(provider, model)` → `ResolvedModelInfo`
+- `resolveModel(provider, model)` → `ResolvedModelInfo`（含 `reasoning.efforts`，dsh 据此显示推理等级选择器）
 - `prepareCall(provider, model)` → `{ model, stream }`
-- `stream(options)` → `AsyncIterable<StreamChunk>`
+- `stream(options)` → `AsyncIterable<StreamChunk>`（将 `reasoningEffort` 作为 `reasoning_effort` 透传给代理）
 
 参考 dsh 源码中的 `LlmAdapter` 类型定义。
 
